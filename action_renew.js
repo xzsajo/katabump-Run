@@ -226,6 +226,69 @@ function getUsers() {
     return [];
 }
 
+// ---- ALTCHA 验证处理函数 ----
+async function attemptAltcha(page) {
+    try {
+        const result = await page.evaluate(async () => {
+            // 方法1: 找 altcha-widget 自定义元素，调用其 verify() API
+            const widget = document.querySelector('altcha-widget');
+            if (!widget) return { found: false };
+
+            await new Promise(r => setTimeout(r, 1500));
+
+            if (typeof widget.verify === 'function') {
+                await widget.verify();
+                return { found: true, method: 'verify()' };
+            }
+
+            // 方法2: 进入 shadowRoot 点击 checkbox
+            const shadow = widget.shadowRoot;
+            if (shadow) {
+                const checkbox = shadow.querySelector('input[type="checkbox"]');
+                if (checkbox && !checkbox.checked) {
+                    checkbox.click();
+                    return { found: true, method: 'shadowRoot checkbox click' };
+                }
+                if (checkbox && checkbox.checked) {
+                    return { found: true, method: 'already checked' };
+                }
+            }
+
+            // 方法3: 派发自定义事件触发自动求解
+            widget.dispatchEvent(new Event('verify', { bubbles: true }));
+            return { found: true, method: 'event dispatch' };
+        });
+
+        if (result.found) {
+            console.log(`   >> [ALTCHA] 验证触发成功，方式: ${result.method}`);
+            // 等待 PoW 计算完成（ALTCHA 是客户端计算，通常 1-3 秒）
+            await page.waitForTimeout(4000);
+
+            // 检查 hidden input 是否有值（ALTCHA 完成后会填入该字段）
+            const solved = await page.evaluate(() => {
+                const input = document.querySelector('input[name="altcha"]');
+                return input && input.value && input.value.length > 10;
+            }).catch(() => false);
+
+            console.log(`   >> [ALTCHA] 求解状态: ${solved ? '✅ 已完成' : '⏳ 计算中或未知'}`);
+            return true;
+        } else {
+            // 没找到 altcha-widget，尝试用 Playwright locator 直接点击
+            const widgetLoc = page.locator('altcha-widget').first();
+            const isVis = await widgetLoc.isVisible({ timeout: 1000 }).catch(() => false);
+            if (isVis) {
+                await widgetLoc.click();
+                console.log('   >> [ALTCHA] Playwright locator 点击 altcha-widget');
+                await page.waitForTimeout(4000);
+                return true;
+            }
+        }
+    } catch (e) {
+        console.log('   >> [ALTCHA] 尝试失败:', e.message);
+    }
+    return false;
+}
+
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -459,37 +522,59 @@ async function attemptTurnstileCdp(page) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
+                    // B. 找验证码：ALTCHA 优先，兼容 Turnstile
+                    console.log('正在检查验证码 (ALTCHA / Turnstile)...');
+                    let captchaClickResult = false;
+                    for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                        // 先尝试 ALTCHA
+                        captchaClickResult = await attemptAltcha(page);
+                        if (captchaClickResult) {
+                            console.log(`   >> [尝试 ${findAttempt + 1}/10] ALTCHA 处理成功。`);
+                            break;
+                        }
+                        // 兼容：再尝试旧 Turnstile
+                        captchaClickResult = await attemptTurnstileCdp(page);
+                        if (captchaClickResult) {
+                            console.log(`   >> [尝试 ${findAttempt + 1}/10] Turnstile 处理成功。`);
+                            break;
+                        }
+                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/10] 尚未找到验证码组件...`);
                         await page.waitForTimeout(1000);
                     }
 
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
-                        await page.waitForTimeout(8000);
+                    let isCaptchaSuccess = false;
+                    if (captchaClickResult) {
+                        // 额外等待验证计算
+                        await page.waitForTimeout(3000);
+
+                        // 检查 ALTCHA hidden input
+                        isCaptchaSuccess = await page.evaluate(() => {
+                            const input = document.querySelector('input[name="altcha"]');
+                            return input && input.value && input.value.length > 10;
+                        }).catch(() => false);
+
+                        // 兼容：检查 Turnstile Success iframe
+                        if (!isCaptchaSuccess) {
+                            const frames = page.frames();
+                            for (const f of frames) {
+                                if (f.url().includes('cloudflare')) {
+                                    try {
+                                        if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                                            console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
+                                            isCaptchaSuccess = true;
+                                            break;
+                                        }
+                                    } catch (e) { }
+                                }
+                            }
+                        }
+                        console.log(`   >> 验证状态: ${isCaptchaSuccess ? '✅ 已确认完成' : '⏳ 无法确认，但继续尝试'}`);
                     } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
+                        console.log('   >> 重试后仍未找到任何验证码组件，直接尝试提交。');
                     }
 
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
-                                    isTurnstileSuccess = true;
-                                    break;
-                                }
-                            } catch (e) { }
-                        }
-                    }
+                    // C. (占位保留，逻辑已合并到上面)
+                    const isTurnstileSuccess = isCaptchaSuccess; // 保持变量名兼容
 
                     // D. 准备点击确认
                     const confirmBtn = modal.getByRole('button', { name: 'Renew' });
