@@ -3,6 +3,10 @@ name: Katabump Auto Renew
 on:
   workflow_dispatch: # 允许手动触发
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   renew:
     runs-on: ubuntu-latest
