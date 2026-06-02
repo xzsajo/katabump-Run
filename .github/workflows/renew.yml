@@ -45,9 +45,9 @@ jobs:
         path: screenshots/
 
     - name: 清理历史运行记录
-        if: always()
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
+      if: always()
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           delete_workflow_pattern: ${{ github.workflow }}
